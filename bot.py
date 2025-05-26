@@ -1,31 +1,40 @@
-
-import discord
-from discord.ext import commands
-from discord.ui import View, Button
 import os
-import random
 import io
 import re
-import pdfplumber
-from PIL import Image, ImageDraw
+import random
+import threading
+import discord
+from discord.ext import commands
+from discord import app_commands
+from discord.ui import View, Button, Modal, TextInput
 from dotenv import load_dotenv
 from google.oauth2 import service_account
-from googleapiclient.discovery import build
+from googleapiclient.discovery import build, MediaFileUpload
 from collections import defaultdict
-from flask import Flask
+import pdfplumber
+from PIL import Image, ImageDraw
 
+# Flask imports
+from flask import Flask, jsonify
+
+# --- Load environment ---
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 GOOGLE_CREDENTIALS = os.getenv("GOOGLE_CREDENTIALS")
 
+# --- Discord bot setup ---
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="!", intents=intents)
+tree = bot.tree
 
 user_scores = defaultdict(int)
 last_question = {}
 
-SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
+SCOPES = [
+    "https://www.googleapis.com/auth/drive.readonly",
+    "https://www.googleapis.com/auth/drive.file"
+]
 creds = service_account.Credentials.from_service_account_file(GOOGLE_CREDENTIALS, scopes=SCOPES)
 drive_service = build("drive", "v3", credentials=creds)
 
@@ -35,7 +44,6 @@ SUBJECT_ALIASES = {
     "ict": "0417", "computerscience": "0478", "cs": "0478",
     "literature": "0475", "accounting": "0452", "economics": "0455"
 }
-
 EXCLUDED_SUBJECTS = {"english", "history", "geography", "business", "french", "global"}
 
 def crop_footer(pil_image, footer_height=70):
@@ -49,6 +57,7 @@ def extract_question_number(text):
     return match.group(1) if match else None
 
 file_cache = {}
+note_folder_cache = {}  # board_subject: folder_id
 
 async def fetch_drive_files():
     global file_cache
@@ -74,6 +83,14 @@ async def fetch_drive_files():
                 continue
             file_cache[subject].append((f["id"], f["name"]))
 
+async def download_file(file_id):
+    request = drive_service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = drive_service._http.request(request.uri)
+    fh.write(downloader[1])
+    fh.seek(0)
+    return fh
+
 class QuestionView(View):
     def __init__(self, subject, file_id, question_number):
         super().__init__(timeout=None)
@@ -94,13 +111,9 @@ class QuestionView(View):
                 ms_file_id = fid
                 break
         if not ms_file_id:
+            await interaction.response.send_message("No marking scheme found.", ephemeral=True)
             return
-
-        request = drive_service.files().get_media(fileId=ms_file_id)
-        fh = io.BytesIO()
-        downloader = build("media", "v1").media().download_media(request, fh)
-        downloader.next_chunk()
-        fh.seek(0)
+        fh = await download_file(ms_file_id)
         with pdfplumber.open(fh) as pdf:
             for page in pdf.pages:
                 text = page.extract_text() or ""
@@ -115,13 +128,10 @@ class QuestionView(View):
 async def post_question(channel, subject, user=None):
     files = file_cache.get(subject)
     if not files:
+        await channel.send("No files found for this subject.")
         return
     file_id, file_name = random.choice(files)
-    request = drive_service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = build("media", "v1").media().download_media(request, fh)
-    downloader.next_chunk()
-    fh.seek(0)
+    fh = await download_file(file_id)
     with pdfplumber.open(fh) as pdf:
         page_num = random.randint(1, len(pdf.pages)-2)
         page = pdf.pages[page_num]
@@ -136,25 +146,93 @@ async def post_question(channel, subject, user=None):
         user_scores[user.id] += 1
     last_question[channel.id] = {"subject": subject, "file_id": file_id, "question_number": question_number}
 
-@bot.command()
-async def question(ctx, *, subject=None):
-    if not subject:
-        await ctx.send("❌ Please specify a subject. Use `!subjectlist`.")
-        return
+# --- SLASH COMMANDS ---
+
+@tree.command(name="question", description="Get a random question for a subject")
+@app_commands.describe(subject="Subject for the question")
+async def slash_question(interaction: discord.Interaction, subject: str):
     subject = subject.lower().strip()
     if subject not in SUBJECT_ALIASES:
-        await ctx.send("❌ Unsupported subject. Use `!subjectlist`.")
+        await interaction.response.send_message("❌ Unsupported subject. Use `/subjectlist`.", ephemeral=True)
         return
-    await post_question(ctx.channel, subject, ctx.author)
+    await interaction.response.defer()
+    await post_question(interaction.channel, subject, interaction.user)
 
-@bot.command()
-async def subjectlist(ctx):
+@tree.command(name="subjectlist", description="List available subjects")
+async def slash_subjectlist(interaction: discord.Interaction):
     available = sorted(set(SUBJECT_ALIASES.keys()) - EXCLUDED_SUBJECTS)
-    await ctx.send("📚 **Supported Subjects:** " + ", ".join(available))
+    await interaction.response.send_message("📚 **Supported Subjects:** " + ", ".join(available), ephemeral=True)
 
+class NoteModal(Modal, title="Upload Note"):
+    board = TextInput(label="Board", required=True, placeholder="e.g. Cambridge")
+    subject = TextInput(label="Subject", required=True, placeholder="e.g. Math")
+    note = TextInput(label="Note", required=False, style=discord.TextStyle.paragraph, placeholder="You can provide a short text note here.")
+
+    def __init__(self):
+        super().__init__()
+
+@tree.command(name="addnote", description="Upload a note for a specific board and subject")
+async def addnote(interaction: discord.Interaction):
+    await interaction.response.send_modal(NoteModal())
+
+@bot.event
+async def on_modal_submit(modal: NoteModal, interaction: discord.Interaction):
+    board = modal.board.value.strip()
+    subject = modal.subject.value.strip().lower()
+    text_note = modal.note.value.strip()
+    folder_name = f"{board}_{subject}_notes"
+    # Find or create Google Drive folder
+    if folder_name in note_folder_cache:
+        folder_id = note_folder_cache[folder_name]
+    else:
+        file_list = drive_service.files().list(q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'", fields="files(id)").execute()
+        if file_list.get("files"):
+            folder_id = file_list["files"][0]["id"]
+        else:
+            folder_metadata = {'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder'}
+            folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
+            folder_id = folder.get('id')
+        note_folder_cache[folder_name] = folder_id
+
+    uploaded_files = []
+    if text_note:
+        note_filename = f"{subject}_note.txt"
+        note_path = f"/tmp/{note_filename}"
+        with open(note_path, "w") as f:
+            f.write(text_note)
+        media = MediaFileUpload(note_path, resumable=True)
+        file_metadata = {'name': note_filename, 'parents': [folder_id]}
+        drive_service.files().create(body=file_metadata, media_body=media, fields='id,webViewLink').execute()
+        uploaded_files.append(note_filename)
+        os.remove(note_path)
+
+    await interaction.response.send_message(
+        f"✅ Uploaded notes to Google Drive folder for {board} {subject}: {', '.join(uploaded_files)}", ephemeral=True
+    )
+
+# --- FLASK SERVER ---
+
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return jsonify({"status": "ok", "message": "IGCSE Discord Bot Flask API running."})
+
+def run_flask():
+    flask_app.run(host="0.0.0.0", port=5000)
+
+# --- Startup logic ---
 @bot.event
 async def on_ready():
     await fetch_drive_files()
+    try:
+        synced = await tree.sync()
+        print(f"✅ Synced {len(synced)} slash commands")
+    except Exception as e:
+        print(f"Slash command sync failed: {e}")
     print(f"✅ Logged in as {bot.user.name}")
 
-bot.run(TOKEN)
+if __name__ == "__main__":
+    flask_thread = threading.Thread(target=run_flask)
+    flask_thread.start()
+    bot.run(TOKEN)
