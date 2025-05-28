@@ -1,23 +1,32 @@
 import os
+import io
+import re
 import json
+import random
 import discord
 from discord.ext import commands
+from discord import app_commands
 from dotenv import load_dotenv
-from drive_utils import get_random_theory_question, get_question_and_mark_scheme
+from collections import defaultdict
+
+from drive_utils import (
+    get_drive_service,
+    list_pdfs_in_folder,
+    filter_theory_papers,
+    get_question_and_mark_scheme,
+)
 from marking_ai import evaluate_answer
 from scheduler import schedule_daily_question
 from flask_app import start_flask_app
-from collections import defaultdict
-from discord import app_commands
+from googleapiclient.http import MediaIoBaseDownload
 
-# -------------- CONFIGURATION --------------
+# ---------------- CONFIG -----------------
 
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
 SCORE_FILE = "scores.json"
 
-# Subject Choices (pretty name, internal key)
 SUBJECT_CHOICES = [
     ("Mathematics (0580)", "mathematics"),
     ("Biology (0610)", "biology"),
@@ -37,7 +46,6 @@ SUBJECT_CHOICES = [
     ("Economics (0455)", "economics"),
 ]
 
-# Google Drive Links
 SUBJECT_DRIVE_LINKS = {
     "mathematics": "https://drive.google.com/drive/folders/1GZUs34yS5dMmhO8Pm8rWokkS7VBQ5bqF?usp=sharing",
     "biology": "https://drive.google.com/drive/folders/1tCMnYUtHJ1jQAqmagUw1h5pWrtHxNwYE?usp=sharing",
@@ -57,14 +65,30 @@ SUBJECT_DRIVE_LINKS = {
     "economics": "https://drive.google.com/drive/folders/1lU4WqKULYiCJzCKPVJYDwsvFVudRB-as?usp=sharing",
 }
 
-# -------------- BOT SETUP --------------
+# ------------- PDF DOWNLOAD -------------
 
-intents = discord.Intents.default()
-intents.message_content = True
-bot = commands.Bot(command_prefix="/", intents=intents)
-tree = bot.tree
+def download_random_pdf(service, folder_id, subject):
+    all_files = list_pdfs_in_folder(service, folder_id)
+    filtered = filter_theory_papers(all_files, subject)
+    if not filtered:
+        return None, None
+    chosen = random.choice(filtered)
+    file_id, file_name = chosen['id'], chosen['name']
+    request = service.files().get_media(fileId=file_id)
+    fh = io.BytesIO()
+    downloader = MediaIoBaseDownload(fh, request)
+    done = False
+    while not done:
+        status, done = downloader.next_chunk()
+    safe_name = re.sub(r'[^\w-.()]', '_', file_name)
+    os.makedirs('pdfs', exist_ok=True)
+    path = os.path.join('pdfs', safe_name)
+    fh.seek(0)
+    with open(path, 'wb') as f:
+        f.write(fh.read())
+    return path, file_name
 
-# -------------- SCORE MANAGEMENT --------------
+# ------------- SCORE MGMT ---------------
 
 def load_scores():
     if os.path.exists(SCORE_FILE):
@@ -77,10 +101,16 @@ def save_scores(scores):
         json.dump(scores, f)
 
 user_scores = load_scores()
-
-# -------------- NOTE SHARING --------------
-
 user_shared_drive_links = defaultdict(list)  # {subject: [links]}
+
+# ------------- DISCORD SETUP ------------
+
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="/", intents=intents)
+tree = bot.tree
+
+# ------------- NOTE MODAL ---------------
 
 class NoteModal(discord.ui.Modal, title="Upload Note or Drive Link"):
     subject = discord.ui.TextInput(label="Subject", required=True, placeholder="E.g. Math")
@@ -93,10 +123,9 @@ class NoteModal(discord.ui.Modal, title="Upload Note or Drive Link"):
             user_shared_drive_links[subject].append(note_content)
             await interaction.response.send_message(f"✅ Saved your Drive link for {subject.title()}.", ephemeral=False)
         else:
-            # Here you can implement uploading text notes to Google Drive if you want.
             await interaction.response.send_message("✅ Text note received and would be uploaded (not implemented).", ephemeral=False)
 
-# -------------- QUESTION VIEW --------------
+# ------------- QUESTION VIEW ------------
 
 class QuestionView(discord.ui.View):
     def __init__(self, subject, question_text, mark_scheme_text, image_path, user_id=None):
@@ -109,18 +138,27 @@ class QuestionView(discord.ui.View):
 
     @discord.ui.button(label="🔄 Next Question", style=discord.ButtonStyle.primary)
     async def next_question(self, interaction: discord.Interaction, button: discord.ui.Button):
-        img, text, mark_scheme, _ = get_question_and_mark_scheme(self.subject.lower())
-        if img:
-            new_view = QuestionView(self.subject, text, mark_scheme or "Mark scheme not available.", img, user_id=interaction.user.id)
+        # Get a new random theory question PDF from Drive
+        try:
+            service = get_drive_service()
+            folder_url = SUBJECT_DRIVE_LINKS.get(self.subject.lower())
+            if not folder_url:
+                await interaction.response.send_message("❌ No Google Drive folder found for this subject.", ephemeral=True)
+                return
+            folder_id = folder_url.split('/')[-2]
+            pdf_path, file_name = download_random_pdf(service, folder_id, self.subject.lower())
+            if not pdf_path:
+                await interaction.response.send_message("No more theory PDFs found.", ephemeral=True)
+                return
+            # Here you could extract a random page as image and text (use pdf2image etc)
+            # For now, just send the PDF file as placeholder:
             await interaction.response.send_message(
-                content=f"**New {self.subject.title()} Question:**\n{text}",
-                file=discord.File(img),
-                view=new_view,
+                content=f"**New {self.subject.title()} Theory PDF:** `{file_name}`",
+                file=discord.File(pdf_path),
                 ephemeral=False
             )
-            bot.question_data[str(interaction.user.id)] = (text, mark_scheme)
-        else:
-            await interaction.response.send_message("No more questions found.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error fetching PDF: {e}", ephemeral=True)
 
     @discord.ui.button(label="🧠 Mark My Answer", style=discord.ButtonStyle.success)
     async def mark_answer(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -159,7 +197,7 @@ class QuestionView(discord.ui.View):
     async def view_mark_scheme(self, interaction: discord.Interaction, button: discord.ui.Button):
         await interaction.response.send_message(f"**Mark Scheme:**\n{self.mark_scheme_text}", ephemeral=True)
 
-# -------------- EVENTS --------------
+# ------------- EVENTS -------------------
 
 @bot.event
 async def on_ready():
@@ -173,7 +211,7 @@ async def on_ready():
     schedule_daily_question(bot, CHANNEL_ID)
     start_flask_app(bot, CHANNEL_ID)
 
-# -------------- PREFIX COMMANDS --------------
+# ------------- PREFIX COMMANDS ----------
 
 @bot.command()
 async def question(ctx, *, subject: str = "mathematics"):
@@ -244,7 +282,7 @@ async def reset_scores(ctx):
     save_scores(user_scores)
     await ctx.send("🧹 All scores have been reset.")
 
-# -------------- SLASH COMMANDS --------------
+# ------------- SLASH COMMANDS -----------
 
 @tree.command(name="question", description="Get a random question from a subject")
 @app_commands.describe(subject="Pick a subject to get a question from")
@@ -285,7 +323,7 @@ async def fetchnote(interaction: discord.Interaction, subject: str):
     else:
         await interaction.response.send_message("❌ No Google Drive folder found for this subject.", ephemeral=False)
 
-# -------------- RUN BOT --------------
+# ------------- RUN BOT ------------------
 
 if __name__ == "__main__":
     bot.run(TOKEN)
