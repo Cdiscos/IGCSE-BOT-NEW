@@ -7,3 +7,7 @@ google-auth-oauthlib
 pdfplumber
 Pillow
 flask
+pymupdf
+fitz
+pdf2image
+schedular
