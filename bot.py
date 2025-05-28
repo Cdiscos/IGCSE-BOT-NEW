@@ -13,8 +13,6 @@ from googleapiclient.discovery import build, MediaFileUpload
 from collections import defaultdict
 import pdfplumber
 from PIL import Image, ImageDraw
-
-# Flask imports
 from flask import Flask, jsonify
 
 # --- Load environment ---
@@ -42,9 +40,23 @@ SUBJECT_ALIASES = {
     "math": "0580", "mathematics": "0580",
     "biology": "0610", "chemistry": "0620", "physics": "0625",
     "ict": "0417", "computerscience": "0478", "cs": "0478",
-    "literature": "0475", "accounting": "0452", "economics": "0455"
+    "literature": "0475", "accounting": "0452", "economics": "0455",
+    "business": "0450", "business studies": "0450", "urdu": "3248"
 }
-EXCLUDED_SUBJECTS = {"english", "history", "geography", "business", "french", "global"}
+EXCLUDED_SUBJECTS = {"english", "history", "geography", "french", "global"}
+
+# Google Drive folders for each subject
+SUBJECT_DRIVE_LINKS = {
+    "accounting": "https://drive.google.com/drive/folders/1qelX7sXIIxdk_v_bLxJRkbpfuBOfDFno",
+    "biology": "https://drive.google.com/drive/folders/1mrh6_cdYUKTGvEN5UyBsLMacRzdsQQtz",
+    "business": "https://drive.google.com/drive/folders/1JKujjCHyUhNM5y8tfonFrZ7ZPS8oH6Fe",
+    "business studies": "https://drive.google.com/drive/folders/1JKujjCHyUhNM5y8tfonFrZ7ZPS8oH6Fe",
+    "chemistry": "https://drive.google.com/drive/folders/1AgLXQz-dPLtpyvDgRVLnQtS7NVoUjtPp",
+    "math": "https://drive.google.com/drive/folders/1HlOXZYhJhEhz9e8KXVoOSr9lM9RQbXQ3",
+    "mathematics": "https://drive.google.com/drive/folders/1HlOXZYhJhEhz9e8KXVoOSr9lM9RQbXQ3",
+    "physics": "https://drive.google.com/drive/folders/1_jnbXYTAVVVDvS-uHs4KQYbyZke5V5Bl",
+    "urdu": "https://drive.google.com/drive/folders/1fXFImXjkvudt3FlqLTH8jCDdZX_LLfDf"
+}
 
 def crop_footer(pil_image, footer_height=70):
     width, height = pil_image.size
@@ -79,7 +91,7 @@ async def fetch_drive_files():
             if "paper 2" in name or "paper 3" in name:
                 if "ict" in subject or "accounting" in subject or "economics" in subject:
                     continue
-            if any(k in name for k in ["practical", "alternative", "geography", "history", "english", "french", "global", "business"]):
+            if any(k in name for k in ["practical", "alternative", "geography", "history", "english", "french", "global"]):
                 continue
             file_cache[subject].append((f["id"], f["name"]))
 
@@ -163,55 +175,64 @@ async def slash_subjectlist(interaction: discord.Interaction):
     available = sorted(set(SUBJECT_ALIASES.keys()) - EXCLUDED_SUBJECTS)
     await interaction.response.send_message("📚 **Supported Subjects:** " + ", ".join(available), ephemeral=True)
 
+# In-memory user-shared links for demo; use persistent storage for production
+user_shared_drive_links = defaultdict(list)
+
 class NoteModal(Modal, title="Upload Note"):
-    board = TextInput(label="Board", required=True, placeholder="e.g. Cambridge")
     subject = TextInput(label="Subject", required=True, placeholder="e.g. Math")
-    note = TextInput(label="Note", required=False, style=discord.TextStyle.paragraph, placeholder="You can provide a short text note here.")
+    note = TextInput(label="Note or Google Drive Link", required=False, style=discord.TextStyle.paragraph, placeholder="Paste your note text OR a Google Drive link here.")
 
     def __init__(self):
         super().__init__()
 
-@tree.command(name="addnote", description="Upload a note for a specific board and subject")
+@tree.command(name="addnote", description="Upload a note or share a Drive link for a subject")
 async def addnote(interaction: discord.Interaction):
     await interaction.response.send_modal(NoteModal())
 
 @bot.event
 async def on_modal_submit(modal: NoteModal, interaction: discord.Interaction):
-    board = modal.board.value.strip()
     subject = modal.subject.value.strip().lower()
-    text_note = modal.note.value.strip()
-    folder_name = f"{board}_{subject}_notes"
-    # Find or create Google Drive folder
-    if folder_name in note_folder_cache:
-        folder_id = note_folder_cache[folder_name]
-    else:
-        file_list = drive_service.files().list(q=f"name='{folder_name}' and mimeType='application/vnd.google-apps.folder'", fields="files(id)").execute()
-        if file_list.get("files"):
-            folder_id = file_list["files"][0]["id"]
+    note_content = modal.note.value.strip()
+    response_msg = ""
+    # If the note_content is a Google Drive link, save it (in-memory here)
+    if note_content.startswith("https://drive.google.com/"):
+        user_shared_drive_links[subject].append(note_content)
+        response_msg = f"✅ Saved your Drive link for {subject.title()}."
+    elif note_content:
+        # Upload text note as a file to the appropriate Drive folder
+        folder_link = SUBJECT_DRIVE_LINKS.get(subject)
+        if folder_link:
+            folder_id = folder_link.split('/')[-1]
+            note_filename = f"{subject}_note.txt"
+            note_path = f"/tmp/{note_filename}"
+            with open(note_path, "w") as f:
+                f.write(note_content)
+            media = MediaFileUpload(note_path, resumable=True)
+            file_metadata = {'name': note_filename, 'parents': [folder_id]}
+            drive_service.files().create(body=file_metadata, media_body=media, fields='id,webViewLink').execute()
+            os.remove(note_path)
+            response_msg = f"✅ Uploaded note for {subject.title()} to its Google Drive folder."
         else:
-            folder_metadata = {'name': folder_name, 'mimeType': 'application/vnd.google-apps.folder'}
-            folder = drive_service.files().create(body=folder_metadata, fields='id').execute()
-            folder_id = folder.get('id')
-        note_folder_cache[folder_name] = folder_id
+            response_msg = f"❌ Subject not recognized or not configured for Drive uploads."
+    else:
+        response_msg = "❌ Please provide a note or a Google Drive link."
+    await interaction.response.send_message(response_msg, ephemeral=True)
 
-    uploaded_files = []
-    if text_note:
-        note_filename = f"{subject}_note.txt"
-        note_path = f"/tmp/{note_filename}"
-        with open(note_path, "w") as f:
-            f.write(text_note)
-        media = MediaFileUpload(note_path, resumable=True)
-        file_metadata = {'name': note_filename, 'parents': [folder_id]}
-        drive_service.files().create(body=file_metadata, media_body=media, fields='id,webViewLink').execute()
-        uploaded_files.append(note_filename)
-        os.remove(note_path)
-
-    await interaction.response.send_message(
-        f"✅ Uploaded notes to Google Drive folder for {board} {subject}: {', '.join(uploaded_files)}", ephemeral=True
-    )
+@tree.command(name="fetchnote", description="Get the Google Drive folder link for a subject and shared links")
+@app_commands.describe(subject="Subject to fetch notes for")
+async def fetchnote(interaction: discord.Interaction, subject: str):
+    subject = subject.strip().lower()
+    folder_link = SUBJECT_DRIVE_LINKS.get(subject)
+    if folder_link:
+        shared_links = user_shared_drive_links.get(subject, [])
+        msg = f"📁 **{subject.title()} Notes Folder:**\n{folder_link}"
+        if shared_links:
+            msg += "\n\n**User Shared Links:**\n" + "\n".join(shared_links)
+        await interaction.response.send_message(msg, ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ No Google Drive folder found for this subject.", ephemeral=True)
 
 # --- FLASK SERVER ---
-
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
