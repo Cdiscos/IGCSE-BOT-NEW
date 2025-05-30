@@ -5,6 +5,19 @@ from discord import app_commands
 from dotenv import load_dotenv
 from collections import defaultdict
 
+# --------- FLASK INTEGRATION ---------
+from flask import Flask
+from threading import Thread
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "IGCSE Discord Bot is running!"
+
+def run_flask():
+    app.run(host="0.0.0.0", port=5000)
+
 # --------- LOAD CONFIG ---------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
@@ -287,4 +300,10 @@ async def on_ready():
 
 # --------- RUN THE BOT ----------
 if __name__ == "__main__":
+    # Start Flask in a separate thread
+    flask_thread = Thread(target=run_flask)
+    flask_thread.daemon = True
+    flask_thread.start()
+
+    # Start Discord bot (blocking)
     bot.run(TOKEN)
