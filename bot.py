@@ -1,329 +1,290 @@
 import os
-import io
-import re
-import json
-import random
 import discord
 from discord.ext import commands
 from discord import app_commands
 from dotenv import load_dotenv
 from collections import defaultdict
 
-from drive_utils import (
-    get_drive_service,
-    list_pdfs_in_folder,
-    filter_theory_papers,
-    get_question_and_mark_scheme,
-)
-from marking_ai import evaluate_answer
-from scheduler import schedule_daily_question
-from flask_app import start_flask_app
-from googleapiclient.http import MediaIoBaseDownload
-
-# ---------------- CONFIG -----------------
-
+# --------- LOAD CONFIG ---------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("DISCORD_CHANNEL_ID"))
-SCORE_FILE = "scores.json"
 
-SUBJECT_CHOICES = [
-    ("Mathematics (0580)", "mathematics"),
-    ("Biology (0610)", "biology"),
-    ("Chemistry (0620)", "chemistry"),
-    ("Physics (0625)", "physics"),
-    ("Geography (0460)", "geography"),
-    ("Information and Communication Technology (0417)", "information and communication technology"),
-    ("Business Studies (0450)", "business studies"),
-    ("Accounting (0452)", "accounting"),
-    ("Computer Science (0478)", "computer science"),
-    ("French - Foreign Language (0520)", "french - foreign language"),
-    ("Literature in English (0475)", "literature in english"),
-    ("English - First Language (0500)", "english - first language"),
-    ("History (0470)", "history"),
-    ("Global Perspectives (0457)", "global perspectives"),
-    ("Enterprise (0454)", "enterprise"),
-    ("Economics (0455)", "economics"),
-]
+# --------- CONSTANTS FOR EMBED STYLE ---------
+EMBED_COLOR = 0x00fff4  # Cyan
+ADDNOTES_CHANNEL_ID = 1377955545071357983  # The channel where all notes/links should go
 
-SUBJECT_DRIVE_LINKS = {
-    "mathematics": "https://drive.google.com/drive/folders/1GZUs34yS5dMmhO8Pm8rWokkS7VBQ5bqF?usp=sharing",
-    "biology": "https://drive.google.com/drive/folders/1tCMnYUtHJ1jQAqmagUw1h5pWrtHxNwYE?usp=sharing",
-    "chemistry": "https://drive.google.com/drive/folders/1Ji-VoRovspqnZtvxhJW1CCdeMilxQBCX?usp=sharing",
-    "physics": "https://drive.google.com/drive/folders/1Baa4OKIzjjtHzwcy1-xwjBuCDMLh2FlW?usp=sharing",
-    "geography": "https://drive.google.com/drive/folders/1xofPQTwhu7pUS0KqO7ielXj0fvmRBTuH?usp=sharing",
-    "information and communication technology": "https://drive.google.com/drive/folders/1CnorPO8wNZNkjvQ6LwzkINZXRo24T6-1?usp=sharing",
-    "business studies": "https://drive.google.com/drive/folders/1EWccBxwaoV4sjCSHG4DadcpIXUVqtdap?usp=sharing",
-    "accounting": "https://drive.google.com/drive/folders/1BEumj8GOd4x0UOVkk8Cq5o5guTgBSeo2?usp=sharing",
-    "computer science": "https://drive.google.com/drive/folders/1-CQZbc8dAxai2Qw-bpddpDudpSIASiaT?usp=sharing",
-    "french - foreign language": "https://drive.google.com/drive/folders/18Hpg4LjOnw7KgRmXqtAq6MTbM5bpwBFx?usp=sharing",
-    "literature in english": "https://drive.google.com/drive/folders/1aNqqrZ6Orl1qyBNsLr8BPhuezofGgXGi?usp=sharing",
-    "english - first language": "https://drive.google.com/drive/folders/1YHvXgahzgsFwkcg3vzpHSrVdj_GnCq7E?usp=sharing",
-    "history": "https://drive.google.com/drive/folders/1A1OHb2CW5cmCSyQf_cqZGemNQtskhgL_?usp=sharing",
-    "global perspectives": "https://drive.google.com/drive/folders/1lTj44aH3tLLEbfK0Tnb5WFG1cwKV3tEJ?usp=sharing",
-    "enterprise": "https://drive.google.com/drive/folders/187ppeu_FyUskOb8--2KOqVrGnkcIVHe5?usp=sharing",
-    "economics": "https://drive.google.com/drive/folders/1lU4WqKULYiCJzCKPVJYDwsvFVudRB-as?usp=sharing",
+# --------- DATA STRUCTURES ---------
+
+PAST_PAPER_BOARDS = {
+    "CIE": {
+        "mathematics": "https://drive.google.com/drive/folders/1GZUs34yS5dMmhO8Pm8rWokkS7VBQ5bqF?usp=sharing",
+        "biology": "https://drive.google.com/drive/folders/1tCMnYUtHJ1jQAqmagUw1h5pWrtHxNwYE?usp=sharing",
+        "chemistry": "https://drive.google.com/drive/folders/1Ji-VoRovspqnZtvxhJW1CCdeMilxQBCX?usp=sharing",
+        "physics": "https://drive.google.com/drive/folders/1Baa4OKIzjjtHzwcy1-xwjBuCDMLh2FlW?usp=sharing",
+        "geography": "https://drive.google.com/drive/folders/1xofPQTwhu7pUS0KqO7ielXj0fvmRBTuH?usp=sharing",
+        "information and communication technology": "https://drive.google.com/drive/folders/1CnorPO8wNZNkjvQ6LwzkINZXRo24T6-1?usp=sharing",
+        "business studies": "https://drive.google.com/drive/folders/1EWccBxwaoV4sjCSHG4DadcpIXUVqtdap?usp=sharing",
+        "accounting": "https://drive.google.com/drive/folders/1BEumj8GOd4x0UOVkk8Cq5o5guTgBSeo2?usp=sharing",
+        "computer science": "https://drive.google.com/drive/folders/1-CQZbc8dAxai2Qw-bpddpDudpSIASiaT?usp=sharing",
+        "french - foreign language": "https://drive.google.com/drive/folders/18Hpg4LjOnw7KgRmXqtAq6MTbM5bpwBFx?usp=sharing",
+        "literature in english": "https://drive.google.com/drive/folders/1aNqqrZ6Orl1qyBNsLr8BPhuezofGgXGi?usp=sharing",
+        "english - first language": "https://drive.google.com/drive/folders/1YHvXgahzgsFwkcg3vzpHSrVdj_GnCq7E?usp=sharing",
+        "history": "https://drive.google.com/drive/folders/1A1OHb2CW5cmCSyQf_cqZGemNQtskhgL_?usp=sharing",
+        "global perspectives": "https://drive.google.com/drive/folders/1lTj44aH3tLLEbfK0Tnb5WFG1cwKV3tEJ?usp=sharing",
+        "enterprise": "https://drive.google.com/drive/folders/187ppeu_FyUskOb8--2KOqVrGnkcIVHe5?usp=sharing",
+        "economics": "https://drive.google.com/drive/folders/1lU4WqKULYiCJzCKPVJYDwsvFVudRB-as?usp=sharing",
+    }
+}
+PAST_PAPER_BOARD_NAMES = list(PAST_PAPER_BOARDS.keys())
+PAST_PAPER_SUBJECTS = list(PAST_PAPER_BOARDS["CIE"].keys())
+
+NOTES_BOARDS = ["IGCSE", "CBSE"]
+
+NOTES_IGCSE_SUBJECTS = {
+    "accounting": "https://drive.google.com/drive/folders/1qelX7sXIIxdk_v_bLxJRkbpfuBOfDFno",
+    "biology": "https://drive.google.com/drive/folders/1mrh6_cdYUKTGvEN5UyBsLMacRzdsQQtz",
+    "business studies": "https://drive.google.com/drive/folders/1JKujjCHyUhNM5y8tfonFrZ7ZPS8oH6Fe",
+    "chemistry": "https://drive.google.com/drive/folders/1AgLXQz-dPLtpyvDgRVLnQtS7NVoUjtPp",
+    "maths": "https://drive.google.com/drive/folders/1HlOXZYhJhEhz9e8KXVoOSr9lM9RQbXQ3",
+    "physics": "https://drive.google.com/drive/folders/1_jnbXYTAVVVDvS-uHs4KQYbyZke5V5Bl",
+    "urdu": "https://drive.google.com/drive/folders/1fXFImXjkvudt3FlqLTH8jCDdZX_LLfDf",
+}
+NOTES_IGCSE_SUBJECT_LIST = list(NOTES_IGCSE_SUBJECTS.keys())
+
+NOTES_CBSE_YEAR_GROUPS = {
+    "Class 10": "https://drive.google.com/drive/folders/11MWj0Byg9Chzn-wxg2_agje8hDaK7JpD",
+    "Class 9": "https://drive.google.com/drive/folders/11GTAGG4PCZgN6-qWVCcDgUrpx2ImQ2-H",
 }
 
-# ------------- PDF DOWNLOAD -------------
+# Stores user-shared links: {(group, subject): [link1, ...]}
+user_shared_links = defaultdict(list)
 
-def download_random_pdf(service, folder_id, subject):
-    all_files = list_pdfs_in_folder(service, folder_id)
-    filtered = filter_theory_papers(all_files, subject)
-    if not filtered:
-        return None, None
-    chosen = random.choice(filtered)
-    file_id, file_name = chosen['id'], chosen['name']
-    request = service.files().get_media(fileId=file_id)
-    fh = io.BytesIO()
-    downloader = MediaIoBaseDownload(fh, request)
-    done = False
-    while not done:
-        status, done = downloader.next_chunk()
-    safe_name = re.sub(r'[^\w-.()]', '_', file_name)
-    os.makedirs('pdfs', exist_ok=True)
-    path = os.path.join('pdfs', safe_name)
-    fh.seek(0)
-    with open(path, 'wb') as f:
-        f.write(fh.read())
-    return path, file_name
-
-# ------------- SCORE MGMT ---------------
-
-def load_scores():
-    if os.path.exists(SCORE_FILE):
-        with open(SCORE_FILE, "r") as f:
-            return json.load(f)
-    return {}
-
-def save_scores(scores):
-    with open(SCORE_FILE, "w") as f:
-        json.dump(scores, f)
-
-user_scores = load_scores()
-user_shared_drive_links = defaultdict(list)  # {subject: [links]}
-
-# ------------- DISCORD SETUP ------------
-
+# --------- DISCORD SETUP ---------
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents)
 tree = bot.tree
 
-# ------------- NOTE MODAL ---------------
+# --------- KEYWORD AUTORESPONDER ---------
+@bot.event
+async def on_message(message):
+    if message.author.bot:
+        return
 
-class NoteModal(discord.ui.Modal, title="Upload Note or Drive Link"):
-    subject = discord.ui.TextInput(label="Subject", required=True, placeholder="E.g. Math")
-    note = discord.ui.TextInput(label="Note or Google Drive Link", style=discord.TextStyle.paragraph, required=True, placeholder="Paste your note or drive link here")
+    content = message.content.lower()
+    if "bestgradez" in content:
+        await message.channel.send("https://bestgradez.com/")
+    elif "nerd cafe" in content:
+        await message.channel.send("https://nerdcafe.org/")
+    await bot.process_commands(message)
+
+# -------------------- /fetchpastpapers --------------------
+@tree.command(name="fetchpastpapers", description="Get a Drive folder for CIE past papers by subject")
+@app_commands.describe(
+    board="Choose the board (only CIE supported)",
+    subject="Choose the subject"
+)
+@app_commands.choices(
+    board=[app_commands.Choice(name="CIE", value="CIE")],
+    subject=[app_commands.Choice(name=s.title(), value=s) for s in PAST_PAPER_SUBJECTS]
+)
+async def fetchpastpapers(interaction: discord.Interaction, board: app_commands.Choice[str], subject: app_commands.Choice[str]):
+    board_key = board.value
+    subject_key = subject.value
+    folder_link = PAST_PAPER_BOARDS.get(board_key, {}).get(subject_key)
+    shared_links = user_shared_links.get((board_key, subject_key), [])
+
+    bot_avatar = interaction.client.user.avatar.url if interaction.client.user.avatar else discord.Embed.Empty
+
+    if not folder_link:
+        await interaction.response.send_message("❌ No Drive folder found for this subject.", ephemeral=True)
+        return
+    embed = discord.Embed(
+        title=f"📄 {board_key} {subject_key.title()} Past Papers",
+        description=f"**Subject:** `{subject_key.title()}`\n\n"
+                    f"**Official Drive Folder:**\n[📁 Click here to open folder]({folder_link})",
+        color=EMBED_COLOR
+    )
+    embed.set_author(name="AjiroTech Notes Assistant", icon_url=bot_avatar)
+    embed.add_field(
+        name="🔗 Useful Links",
+        value=f"[Official Drive Folder]({folder_link})",
+        inline=False
+    )
+    if shared_links:
+        embed.add_field(
+            name="✨ User Shared Links",
+            value="\n".join([f"`{i+1}.` {link}" for i, link in enumerate(shared_links)]),
+            inline=False
+        )
+    embed.set_footer(text="Powered by xcho_", icon_url=bot_avatar)
+    await interaction.response.send_message(embed=embed, ephemeral=False)
+
+# -------------------- /fetchnotes --------------------
+class CBSEYearGroupSelect(discord.ui.Select):
+    def __init__(self, callback):
+        options = [
+            discord.SelectOption(label="Class 10", value="Class 10"),
+            discord.SelectOption(label="Class 9", value="Class 9"),
+        ]
+        super().__init__(placeholder="Choose CBSE Year Group", min_values=1, max_values=1, options=options)
+        self.callback_fn = callback
+
+    async def callback(self, interaction: discord.Interaction):
+        await self.callback_fn(interaction, self.values[0])
+
+class CBSEYearGroupView(discord.ui.View):
+    def __init__(self, callback):
+        super().__init__(timeout=60)
+        self.add_item(CBSEYearGroupSelect(callback))
+
+@tree.command(name="fetchnotes", description="Get Drive folder for notes by board and subject/year group")
+@app_commands.describe(
+    board="Choose the board (IGCSE or CBSE)",
+    subject="Choose subject (for IGCSE) or leave blank for CBSE"
+)
+@app_commands.choices(
+    board=[app_commands.Choice(name=b, value=b) for b in NOTES_BOARDS],
+    subject=[app_commands.Choice(name=s.title(), value=s) for s in NOTES_IGCSE_SUBJECT_LIST]
+)
+async def fetchnotes(
+    interaction: discord.Interaction,
+    board: app_commands.Choice[str],
+    subject: app_commands.Choice[str] = None
+):
+    board_key = board.value
+    bot_avatar = interaction.client.user.avatar.url if interaction.client.user.avatar else discord.Embed.Empty
+
+    if board_key == "IGCSE":
+        if not subject:
+            await interaction.response.send_message("Please select a subject for IGCSE.", ephemeral=True)
+            return
+        subject_key = subject.value
+        folder_link = NOTES_IGCSE_SUBJECTS.get(subject_key)
+        shared_links = user_shared_links.get((board_key, subject_key), [])
+        if not folder_link:
+            await interaction.response.send_message("❌ No Drive folder found for this subject.", ephemeral=True)
+            return
+        embed = discord.Embed(
+            title=f"📚 IGCSE {subject_key.title()} Notes",
+            description=f"**Subject:** `{subject_key.title()}`\n\n"
+                        f"**Official Drive Folder:**\n[📁 Click here to open folder]({folder_link})",
+            color=EMBED_COLOR
+        )
+        embed.set_author(name="AjiroTech Notes Assistant", icon_url=bot_avatar)
+        embed.add_field(
+            name="🔗 Useful Links",
+            value=f"[Official Drive Folder]({folder_link})",
+            inline=False
+        )
+        if shared_links:
+            embed.add_field(
+                name="✨ User Shared Links",
+                value="\n".join([f"`{i+1}.` {link}" for i, link in enumerate(shared_links)]),
+                inline=False
+            )
+        embed.set_footer(text="Powered by xcho_", icon_url=bot_avatar)
+        await interaction.response.send_message(embed=embed, ephemeral=False)
+
+    elif board_key == "CBSE":
+        async def cbse_year_selected_callback(new_interaction, year_group):
+            bot_avatar = new_interaction.client.user.avatar.url if new_interaction.client.user.avatar else discord.Embed.Empty
+            folder_link = NOTES_CBSE_YEAR_GROUPS.get(year_group)
+            if not folder_link:
+                await new_interaction.response.send_message("❌ No Drive folder found for this year group.", ephemeral=True)
+                return
+            embed = discord.Embed(
+                title=f"📚 CBSE {year_group} Notes",
+                description=f"**Year Group:** `{year_group}`\n\n"
+                            f"**Official Drive Folder:**\n[📁 Click here to open folder]({folder_link})",
+                color=EMBED_COLOR
+            )
+            embed.set_author(name="AjiroTech Notes Assistant", icon_url=bot_avatar)
+            embed.add_field(
+                name="🔗 Useful Links",
+                value=f"[Official Drive Folder]({folder_link})",
+                inline=False
+            )
+            embed.set_footer(text="Powered by xcho_", icon_url=bot_avatar)
+            await new_interaction.response.send_message(embed=embed, ephemeral=False)
+        view = CBSEYearGroupView(cbse_year_selected_callback)
+        await interaction.response.send_message("Please select your CBSE year group:", view=view, ephemeral=True)
+    else:
+        await interaction.response.send_message("❌ Board not recognized.", ephemeral=True)
+
+# -------------------- /addnotes --------------------
+
+class AddNoteModal(discord.ui.Modal, title="Add a Note or Drive Link"):
+    def __init__(self):
+        super().__init__()
+        self.add_item(discord.ui.TextInput(
+            label="Group (e.g. IGCSE, A LEVELS, AS)", 
+            required=True, 
+            placeholder="IGCSE, A LEVELS, AS"
+        ))
+        self.add_item(discord.ui.TextInput(
+            label="Subject (e.g. Mathematics, Physics, Biology)", 
+            required=True, 
+            placeholder="Mathematics"
+        ))
+        self.add_item(discord.ui.TextInput(
+            label="Drive Link or Note",
+            style=discord.TextStyle.paragraph,
+            required=True,
+            placeholder="Paste a Google Drive link or type your note here."
+        ))
 
     async def on_submit(self, interaction: discord.Interaction):
-        subject = self.subject.value.strip().lower()
-        note_content = self.note.value.strip()
-        if note_content.startswith("https://drive.google.com/"):
-            user_shared_drive_links[subject].append(note_content)
-            await interaction.response.send_message(f"✅ Saved your Drive link for {subject.title()}.", ephemeral=False)
-        else:
-            await interaction.response.send_message("✅ Text note received and would be uploaded (not implemented).", ephemeral=False)
+        group = self.children[0].value.strip().upper()
+        subject = self.children[1].value.strip().title()
+        note_link = self.children[2].value.strip()
+        user = interaction.user
+        bot_avatar = interaction.client.user.avatar.url if interaction.client.user.avatar else discord.Embed.Empty
 
-# ------------- QUESTION VIEW ------------
+        # Save for lookup if needed
+        user_shared_links[(group, subject.lower())].append(note_link)
 
-class QuestionView(discord.ui.View):
-    def __init__(self, subject, question_text, mark_scheme_text, image_path, user_id=None):
-        super().__init__(timeout=None)
-        self.subject = subject
-        self.question_text = question_text
-        self.mark_scheme_text = mark_scheme_text
-        self.image_path = image_path
-        self.user_id = user_id
+        # Compose message for the channel
+        embed = discord.Embed(
+            title=f"📝 New User Note/Link Submission",
+            description=f"**Group:** `{group}`\n**Subject:** `{subject}`\n\n"
+                        f"**Content:**\n>>> {note_link}",
+            color=EMBED_COLOR
+        )
+        embed.set_author(name="AjiroTech Notes Assistant", icon_url=bot_avatar)
+        embed.add_field(
+            name="🆔 User",
+            value=f"{user.mention} (`{user.id}`)",
+            inline=True
+        )
+        embed.set_footer(text="Powered by xcho_", icon_url=bot_avatar)
 
-    @discord.ui.button(label="🔄 Next Question", style=discord.ButtonStyle.primary)
-    async def next_question(self, interaction: discord.Interaction, button: discord.ui.Button):
-        # Get a new random theory question PDF from Drive
-        try:
-            service = get_drive_service()
-            folder_url = SUBJECT_DRIVE_LINKS.get(self.subject.lower())
-            if not folder_url:
-                await interaction.response.send_message("❌ No Google Drive folder found for this subject.", ephemeral=True)
-                return
-            folder_id = folder_url.split('/')[-2]
-            pdf_path, file_name = download_random_pdf(service, folder_id, self.subject.lower())
-            if not pdf_path:
-                await interaction.response.send_message("No more theory PDFs found.", ephemeral=True)
-                return
-            # Here you could extract a random page as image and text (use pdf2image etc)
-            # For now, just send the PDF file as placeholder:
-            await interaction.response.send_message(
-                content=f"**New {self.subject.title()} Theory PDF:** `{file_name}`",
-                file=discord.File(pdf_path),
-                ephemeral=False
-            )
-        except Exception as e:
-            await interaction.response.send_message(f"❌ Error fetching PDF: {e}", ephemeral=True)
+        # Try to get the channel (cached or fetch)
+        channel = interaction.client.get_channel(ADDNOTES_CHANNEL_ID)
+        if channel is None:
+            try:
+                channel = await interaction.client.fetch_channel(ADDNOTES_CHANNEL_ID)
+            except Exception:
+                channel = None
 
-    @discord.ui.button(label="🧠 Mark My Answer", style=discord.ButtonStyle.success)
-    async def mark_answer(self, interaction: discord.Interaction, button: discord.ui.Button):
-        class AnswerModal(discord.ui.Modal, title="Submit Your Answer"):
-            answer = discord.ui.TextInput(label="Your Answer", style=discord.TextStyle.paragraph, required=True)
+        if channel is not None:
+            await channel.send(embed=embed)
 
-            async def on_submit(self, modal_interaction: discord.Interaction):
-                user = str(modal_interaction.user.id)
-                if not hasattr(bot, "question_data") or user not in bot.question_data:
-                    await modal_interaction.response.send_message("❌ Please answer a question first using /question.", ephemeral=True)
-                    return
-                question_text, mark_scheme = bot.question_data[user]
-                response = self.answer.value
-                try:
-                    result = evaluate_answer(question_text, response, mark_scheme)
-                    lines = result.strip().splitlines()
-                    mark = 0
-                    explanation = "No explanation."
-                    for line in lines:
-                        if line.strip().isdigit():
-                            mark = int(line.strip())
-                        else:
-                            explanation = line
-                    user_scores[user] = user_scores.get(user, 0) + mark
-                    save_scores(user_scores)
-                    await modal_interaction.response.send_message(
-                        f"📥 **Your Answer Result:**\n"
-                        f"✅ Marked by AI:\n**{mark} mark(s)** awarded.\n🧠 *{explanation}*",
-                        ephemeral=False
-                    )
-                except Exception as e:
-                    await modal_interaction.response.send_message(f"❌ Error during evaluation: {str(e)}", ephemeral=True)
-        await interaction.response.send_modal(AnswerModal())
+        await interaction.response.send_message(
+            f"✅ Your note/link was sent to the Administration! Thank you for sharing.",
+            ephemeral=True
+        )
 
-    @discord.ui.button(label="🧾 View Mark Scheme", style=discord.ButtonStyle.secondary)
-    async def view_mark_scheme(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message(f"**Mark Scheme:**\n{self.mark_scheme_text}", ephemeral=True)
+@tree.command(name="addnotes", description="Share a Drive link or note for a subject and group (e.g. IGCSE, A LEVELS, AS)")
+async def addnotes(interaction: discord.Interaction):
+    await interaction.response.send_modal(AddNoteModal())
 
-# ------------- EVENTS -------------------
-
+# --------- SYNC COMMANDS ON READY ---------
 @bot.event
 async def on_ready():
-    bot.question_data = {}
-    print(f"Logged in as {bot.user} (ID: {bot.user.id})")
-    try:
-        synced = await tree.sync()
-        print(f"Synced {len(synced)} slash commands")
-    except Exception as e:
-        print(f"Error syncing commands: {e}")
-    schedule_daily_question(bot, CHANNEL_ID)
-    start_flask_app(bot, CHANNEL_ID)
+    await tree.sync()
+    print(f"Logged in as {bot.user}")
 
-# ------------- PREFIX COMMANDS ----------
-
-@bot.command()
-async def question(ctx, *, subject: str = "mathematics"):
-    img, text, mark_scheme, _ = get_question_and_mark_scheme(subject.lower())
-    if img:
-        view = QuestionView(subject, text, mark_scheme, img, user_id=ctx.author.id)
-        await ctx.send(
-            content=f"📘 **{subject.title()} Question:**\n{text}",
-            file=discord.File(img),
-            view=view
-        )
-        bot.question_data[str(ctx.author.id)] = (text, mark_scheme)
-    else:
-        await ctx.send("❌ No theory question available for that subject.")
-
-@bot.command()
-async def answer(ctx, *, response: str):
-    user = str(ctx.author.id)
-    if not hasattr(bot, "question_data") or user not in bot.question_data:
-        await ctx.send("❌ Please answer a question first using `/question`.")
-        return
-    question_text, mark_scheme = bot.question_data[user]
-    try:
-        result = evaluate_answer(question_text, response, mark_scheme)
-        lines = result.strip().splitlines()
-        mark = 0
-        explanation = "No explanation."
-        for line in lines:
-            if line.strip().isdigit():
-                mark = int(line.strip())
-            else:
-                explanation = line
-        user_scores[user] = user_scores.get(user, 0) + mark
-        save_scores(user_scores)
-        await ctx.send(
-            f"📥 **Your Answer Result:**\n"
-            f"✅ Marked by AI:\n**{mark} mark(s)** awarded.\n🧠 *{explanation}*"
-        )
-    except Exception as e:
-        await ctx.send(f"❌ Error during evaluation: {str(e)}")
-
-@bot.command()
-async def score(ctx):
-    user = str(ctx.author.id)
-    score = user_scores.get(user, 0)
-    await ctx.send(f"🏅 **{ctx.author.display_name}**, your total score is: **{score}**")
-
-@bot.command()
-async def leaderboard(ctx):
-    if not user_scores:
-        await ctx.send("No scores recorded yet.")
-        return
-    sorted_scores = sorted(user_scores.items(), key=lambda x: x[1], reverse=True)
-    leaderboard_text = "\n".join(
-        [f"{i+1}. <@{user}> — {score} pts" for i, (user, score) in enumerate(sorted_scores)]
-    )
-    await ctx.send(f"📊 **Leaderboard**:\n{leaderboard_text}")
-
-def is_admin(ctx):
-    return ctx.author.guild_permissions.administrator
-
-@bot.command()
-async def reset_scores(ctx):
-    if not is_admin(ctx):
-        await ctx.send("🚫 You are not authorized to use this command.")
-        return
-    user_scores.clear()
-    save_scores(user_scores)
-    await ctx.send("🧹 All scores have been reset.")
-
-# ------------- SLASH COMMANDS -----------
-
-@tree.command(name="question", description="Get a random question from a subject")
-@app_commands.describe(subject="Pick a subject to get a question from")
-@app_commands.choices(subject=[
-    app_commands.Choice(name=pretty, value=internal)
-    for pretty, internal in SUBJECT_CHOICES
-])
-async def slash_question(interaction: discord.Interaction, subject: app_commands.Choice[str]):
-    chosen_subject = subject.value
-    img, text, mark_scheme, _ = get_question_and_mark_scheme(chosen_subject.lower())
-    if img:
-        view = QuestionView(chosen_subject, text, mark_scheme, img, user_id=interaction.user.id)
-        await interaction.response.send_message(
-            content=f"📘 **{chosen_subject.title()} Question:**\n{text}",
-            file=discord.File(img),
-            view=view,
-            ephemeral=False
-        )
-        bot.question_data[str(interaction.user.id)] = (text, mark_scheme)
-    else:
-        await interaction.response.send_message("❌ No theory question available for that subject.", ephemeral=False)
-
-@tree.command(name="addnote", description="Upload a note or share a Drive link for a subject")
-async def addnote(interaction: discord.Interaction):
-    await interaction.response.send_modal(NoteModal())
-
-@tree.command(name="fetchnote", description="Get the Google Drive folder link for a subject and shared links")
-@app_commands.describe(subject="Subject to fetch notes for (e.g. math, biology, business studies, etc.)")
-async def fetchnote(interaction: discord.Interaction, subject: str):
-    subject = subject.strip().lower()
-    folder_link = SUBJECT_DRIVE_LINKS.get(subject)
-    if folder_link:
-        shared_links = user_shared_drive_links.get(subject, [])
-        msg = f"📁 **{subject.title()} Notes Folder:**\n{folder_link}"
-        if shared_links:
-            msg += "\n\n**User Shared Links:**\n" + "\n".join(shared_links)
-        await interaction.response.send_message(msg, ephemeral=False)
-    else:
-        await interaction.response.send_message("❌ No Google Drive folder found for this subject.", ephemeral=False)
-
-# ------------- RUN BOT ------------------
-
+# --------- RUN THE BOT ----------
 if __name__ == "__main__":
     bot.run(TOKEN)
